@@ -2,7 +2,7 @@
 
 // https://stackoverflow.com/a/61681112/4889030
 // https://matklad.github.io/2020/10/03/fast-thread-locals-in-rust.html
-use std::cell::Cell;
+use std::{cell::Cell, convert::Infallible};
 
 use evenio::prelude::Component;
 use rayon::iter::IntoParallelRefMutIterator;
@@ -87,11 +87,12 @@ impl BroadcastBuf {
     /// Creates a new [`Self`] with the given compression level.
     pub fn new(compression_level: CompressionThreshold) -> Self {
         Self {
-            rayon_local: RayonLocal::init_with(|| {
+            rayon_local: RayonLocal::init_with::<Infallible>(|| {
                 let mut encoder = PacketEncoder::default();
                 encoder.set_compression(compression_level);
-                Cell::new(encoder)
-            }),
+                Ok(Cell::new(encoder))
+            })
+            .unwrap(),
         }
     }
 }

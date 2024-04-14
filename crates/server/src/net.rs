@@ -6,18 +6,17 @@ use std::{
     alloc::{alloc_zeroed, handle_alloc_error, Layout},
     borrow::Cow,
     cell::{Cell, UnsafeCell},
-    io,
-    io::ErrorKind,
-    net::ToSocketAddrs,
+    io::{self, ErrorKind},
+    marker::PhantomData,
+    net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     os::fd::{AsRawFd, RawFd},
     ptr::addr_of_mut,
     sync::{
         atomic::{AtomicU16, AtomicU32, Ordering},
         Arc,
     },
-    net::{TcpListener, TcpStream},
     time::{Duration, Instant},
-    marker::PhantomData
+    usize,
 };
 
 use anyhow::{ensure, Context};
@@ -26,16 +25,25 @@ use base64::Engine;
 use bytes::BytesMut;
 use derive_build::Build;
 use evenio::prelude::Component;
-use libc::iovec;
-use monoio::{
-    buf::IoVecBuf,
-    io::{
-        AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, OwnedReadHalf, OwnedWriteHalf, Splitable,
-    },
-    FusionRuntime,
+use io_uring::{
+    cqueue::buffer_select,
+    squeue::{self, SubmissionQueue},
+    types::{BufRingEntry, Fixed},
+    IoUring,
 };
+use libc::iovec;
+use rand_distr::num_traits::Signed;
+// use monoio::{
+//     buf::IoVecBuf,
+//     io::{
+//         AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, OwnedReadHalf, OwnedWriteHalf, Splitable,
+//     },
+//     FusionRuntime,
+// };
 use serde_json::json;
 use sha2::Digest;
+use slab::Slab;
+use socket2::{Domain, Protocol, Socket, Type};
 use tracing::{debug, error, info, instrument, trace, warn};
 use valence_protocol::{
     decode::PacketFrame,
@@ -48,7 +56,6 @@ use valence_protocol::{
     uuid::Uuid,
     Bounded, CompressionThreshold, Decode, Encode, PacketDecoder, PacketEncoder, VarInt,
 };
-use io_uring::{cqueue::buffer_select, squeue::SubmissionQueue, types::{BufRingEntry, Fixed}, IoUring};
 
 use crate::{config, global};
 
@@ -58,26 +65,22 @@ const DEFAULT_SPEED: u32 = 1024 * 1024;
 /// The maximum number of buffers a vectored write can have.
 const MAX_VECTORED_WRITE_BUFS: usize = 16;
 
-const COMPLETION_QUEUE_SIZE: u32 = 32768;
-const SUBMISSION_QUEUE_SIZE: u32 = 32768;
-const IO_URING_FILE_COUNT: u32 = 32768;
-const C2S_RING_ENTRY_COUNT: usize = 4;
-const C2S_RING_BUFFER_COUNT: usize = 4;
+// TODO: Reduce?
+const COMPLETION_QUEUE_SIZE: u32 = 8192;
+const SUBMISSION_QUEUE_SIZE: u32 = 4096;
+const IO_URING_FILE_COUNT: u32 = 4096;
+
+const LISTENER_FIXED_FD: Fixed = Fixed(0);
 
 /// Size of each buffer in bytes
 const C2S_RING_BUFFER_LEN: usize = 4096;
-
-const LISTENER_FIXED_FD: Fixed = Fixed(0);
+// const C2S_RING_ENTRY_COUNT: usize = 4096;
+// const C2S_RING_BUFFER_COUNT: usize = 4096;
+const C2S_RING_ENTRY_COUNT: usize = 4;
+const C2S_RING_BUFFER_COUNT: usize = 4;
 const C2S_BUFFER_GROUP_ID: u16 = 0;
 
 const IORING_CQE_F_MORE: u32 = 1 << 1;
-
-/// How long we wait from when we get the first buffer to when we start sending all of the ones we have collected.
-/// This is closely related to [`MAX_VECTORED_WRITE_BUFS`].
-const WRITE_DELAY: Duration = Duration::from_millis(1);
-
-/// How much we expand our read buffer each time a packet is too large.
-const READ_BUF_SIZE: usize = 4096;
 
 /// The Minecraft protocol version this library currently targets.
 pub const PROTOCOL_VERSION: i32 = 763;
@@ -87,6 +90,7 @@ pub const MAX_PACKET_SIZE: usize = 0x001F_FFFF;
 
 /// The stringified name of the Minecraft version this library currently
 /// targets.
+// TODO: Move this to lib.rs?
 pub const MINECRAFT_VERSION: &str = "1.20.1";
 
 /// Get a [`Uuid`] based on the given user's name.
@@ -103,25 +107,20 @@ fn offline_uuid(username: &str) -> anyhow::Result<Uuid> {
 pub struct ClientConnection {
     /// The local encoder used by that player
     pub encoder: Encoder,
-    /// The name of the player.
-    pub name: Box<str>,
-    /// The UUID of the player.
-    pub uuid: Uuid,
+    pub fd: Fixed,
 }
 
-/// Used during handshake to communicate with the client.
-//pub struct Io {
-//    /// The stream of bytes from the client.
-//    stream: TcpStream,
-//    /// The decoding buffer and logic
-//    dec: PacketDecoder,
-//    /// The encoding buffer and logic
-//    enc: PacketEncoder,
-//    /// The latest frame received from the client.
-//    frame: PacketFrame,
-//    /// The shared state between the ECS framework and the I/O thread.
-//    shared: Arc<global::Shared>,
-//}
+impl ClientConnection {
+    /// `server` must be the same [`Server`] that created this [`ClientConnection`]
+    pub fn flush(&mut self, server: &mut Server) {
+        // TODO: Get compression level from [`Shared`] or a constant
+        let bytes = self.encoder.take(CompressionThreshold(64));
+        server.request(Token::Write {
+            fd: self.fd,
+            bufs: Buf::new(bytes),
+        })
+    }
+}
 
 #[derive(Component)]
 pub struct Encoder {
@@ -178,65 +177,40 @@ impl Encoder {
     }
 }
 
-/// An incoming packet that is tied to a user.
-pub struct UserPacketFrame {
-    /// The raw packet
-    pub packet: PacketFrame,
-    /// The UUID of the user
-    /// todo: user is 128 bits, could we get away with fewer?
-    pub user: Uuid,
-}
-
 /// A buffer which can be used with `writev`.
+#[derive(Default)]
 struct Buf {
-    /// The [`iovec`]s to write
-    iovecs: ArrayVec<iovec, MAX_VECTORED_WRITE_BUFS>,
-    /// Reference to the original [`bytes::Bytes`] used to create the [`iovec`]s. This is important so they do
-    /// not get freed.
-    _ref: ArrayVec<bytes::Bytes, MAX_VECTORED_WRITE_BUFS>,
-    /// The index of the [`iovec`] that is currently being written to.
-    idx: usize,
-}
-
-// SAFETY: The underlying data will live longer than this struct.
-unsafe impl IoVecBuf for Buf {
-    fn read_iovec_ptr(&self) -> *const iovec {
-        unsafe { self.iovecs.as_ptr().add(self.idx) }
-    }
-
-    fn read_iovec_len(&self) -> usize {
-        self.iovecs.len() - self.idx
-    }
+    bytes: bytes::Bytes,
+    offset: usize,
 }
 
 impl Buf {
+    fn new(bytes: bytes::Bytes) -> Self {
+        Buf { bytes, offset: 0 }
+    }
+
     /// Given a result of `writev`, this will allow for progressing the buffer by the number of bytes written.
     ///
     /// If the number of bytes is the entire buffer, then `None` is returned.
-    fn progress(mut self, mut len: usize) -> Option<Self> {
-        loop {
-            let vec = self.iovecs.get_mut(self.idx)?;
-            let iov_len = vec.iov_len;
+    fn progress(mut self, len: usize) -> Option<Self> {
+        self.offset += len;
 
-            // this is perhaps not strictly needed, but we should not be writing zero-length iovecs
-            // anyway. It probably hurts performance.
-            debug_assert!(iov_len > 0);
-
-            if len >= iov_len {
-                len -= iov_len;
-                self.idx += 1;
-                continue;
-            }
-
-            vec.iov_len -= len;
-            vec.iov_base = unsafe { vec.iov_base.add(len) };
-
-            return Some(self);
+        if self.offset >= self.bytes.len() {
+            return None;
         }
+
+        Some(self)
+    }
+
+    fn to_raw_parts(&self) -> (*const u8, usize) {
+        (
+            unsafe { self.bytes.as_ptr().add(self.offset) },
+            self.bytes.len() - self.offset,
+        )
     }
 }
 
-//impl IoWrite {
+// impl IoWrite {
 //    /// This function returns the number of bytes in the TCP send queue that have
 //    /// been sent but have not been acknowledged by the client.
 //    ///
@@ -288,7 +262,7 @@ impl Buf {
 //    }
 //}
 
-//impl Io {
+// impl Io {
 //    /// Receives a packet from the connection.
 //    pub async fn recv_packet<'a, P>(&'a mut self) -> anyhow::Result<P>
 //    where
@@ -628,109 +602,9 @@ impl Buf {
 //    }
 //}
 
-/// logs all errors that occur when writing to the connection.
-///
-/// this is far better than panicking because it allows us to log the error and continue handling other
-/// clients/connections
-async fn print_errors(future: impl core::future::Future<Output = anyhow::Result<()>>) {
-    if let Err(err) = future.await {
-        error!("{:?}", err);
-    }
-}
-
-/// All incoming packets.
-///
-/// todo: `GLOBAL_CTS_PACKETS` there is a lot of room for improvement and experimentation here.
-/// Perhaps could implement some type of `MultiMap` such that a certain player can have their packets queried
-/// easier.
-/// This would be especially useful when we are processing packets in parallel.
-///
-/// Also, this should not be a static ideally but instead an `Arc` probably in [`global::Shared`].
-//pub static GLOBAL_C2S_PACKETS: spin::Mutex<Vec<UserPacketFrame>> = spin::Mutex::new(Vec::new());
-//
-//#[instrument(skip_all)]
-//async fn main_loop(
-//    tx: flume::Sender<ClientConnection>,
-//    address: impl ToSocketAddrs,
-//    shared: Arc<global::Shared>,
-//) {
-//    let listener = match TcpListener::bind(address) {
-//        Ok(listener) => listener,
-//        Err(e) => {
-//            error!("failed to bind: {e}");
-//            return;
-//        }
-//    };
-//
-//    let id = 0;
-//
-//    // accept incoming connections
-//    loop {
-//        let stream = match listener.accept().await {
-//            Ok((stream, _)) => stream,
-//            Err(e) => {
-//                warn!("accept failed: {e} ... {e:?}");
-//                continue;
-//            }
-//        };
-//
-//        let process = Io::new(stream, shared.clone());
-//
-//        let tx = tx.clone();
-//
-//        let action = process.process_new_connection(id, tx);
-//        let action = print_errors(action);
-//
-//        monoio::spawn(action);
-//    }
-//}
-//
-///// Initializes the I/O thread.
-//pub fn init_io_thread(
-//    shutdown: flume::Receiver<()>,
-//    address: impl ToSocketAddrs + Send + Sync + 'static,
-//    shared: Arc<global::Shared>,
-//) -> anyhow::Result<flume::Receiver<ClientConnection>> {
-//    let (connection_tx, connection_rx) = flume::unbounded();
-//
-//    std::thread::Builder::new()
-//        .name("io".to_string())
-//        .spawn(move || {
-//            let mut runtime = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
-//                .enable_timer()
-//                .build()
-//                .unwrap();
-//
-//            match &runtime {
-//                #[cfg(target_os = "linux")]
-//                FusionRuntime::Uring(_) => {
-//                    info!("monoio is using io_uring runtime");
-//                }
-//                FusionRuntime::Legacy(_) => {
-//                    info!("monoio is using legacy runtime");
-//                }
-//            }
-//
-//            runtime.block_on(async move {
-//                let run = main_loop(connection_tx, address, shared);
-//                let shutdown = shutdown.recv_async();
-//
-//                monoio::select! {
-//                    () = run => {},
-//                    _ = shutdown => {},
-//                }
-//            });
-//        })
-//        .context("failed to spawn io thread")?;
-//
-//    Ok(connection_rx)
-//}
-
 fn page_size() -> usize {
     // SAFETY: This is valid
-    unsafe {
-        libc::sysconf(libc::_SC_PAGESIZE) as usize
-    }
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }
 
 fn alloc_zeroed_page_aligned<T>(len: usize) -> *mut T {
@@ -752,48 +626,69 @@ fn alloc_zeroed_page_aligned<T>(len: usize) -> *mut T {
     data.cast()
 }
 
-pub enum ServerEvent {
-    AddPlayer {
-        fd: Fixed
-    },
-    RemovePlayer {
-        fd: Fixed
-    }
+pub enum ServerEvent<'buffer> {
+    AddPlayer { fd: Fixed },
+    RemovePlayer { fd: Fixed },
+    Receive { fd: Fixed, buffer: &'buffer [u8] },
 }
 
 pub struct Server {
-    listener: TcpListener,
+    socket: Socket,
     uring: IoUring,
+
+    slab: Slab<Token>,
 
     c2s_buffer: *mut [UnsafeCell<u8>; C2S_RING_BUFFER_LEN],
     c2s_local_tail: u16,
     c2s_shared_tail: *const AtomicU16,
-
-    /// Make Listener !Send and !Sync to let io_uring assume that it'll only be accessed by 1
-    /// thread
-    phantom: PhantomData<*const ()>
 }
 
-impl Server {
-    pub fn new(address: impl ToSocketAddrs) -> anyhow::Result<Self> {
-        let listener = TcpListener::bind(address)?;
-        // TODO: Try to use defer taskrun
-        let mut uring = IoUring::builder().setup_cqsize(COMPLETION_QUEUE_SIZE).setup_submit_all().setup_coop_taskrun().setup_single_issuer().build(SUBMISSION_QUEUE_SIZE).unwrap();
+unsafe impl Send for Server {}
+// TODO: Didnt want to add negative bounds feature
+// impl !Sync for Server {}
 
-        let mut submitter = uring.submitter();
+impl Server {
+    pub fn new(address: SocketAddr) -> anyhow::Result<Self> {
+        let socket = Socket::new(
+            Domain::for_address(address),
+            Type::STREAM,
+            Some(Protocol::TCP),
+        )
+        .context("Create socket")?;
+        socket.set_reuse_address(true).context("Set SO_REUSEADDR")?;
+        socket.set_reuse_port(true).context("Set SO_REUSEPORT")?;
+        socket.bind(&address.into());
+
+        // TODO: Try to use defer taskrun
+        let uring = IoUring::builder()
+            .setup_cqsize(COMPLETION_QUEUE_SIZE)
+            .setup_submit_all()
+            .setup_coop_taskrun()
+            // .setup_single_issuer()
+            .build(SUBMISSION_QUEUE_SIZE)
+            .unwrap();
+
+        let submitter = uring.submitter();
         submitter.register_files_sparse(IO_URING_FILE_COUNT)?;
-        assert_eq!(submitter.register_files_update(LISTENER_FIXED_FD.0, &[listener.as_raw_fd()])?, 1);
+        assert_eq!(
+            submitter.register_files_update(LISTENER_FIXED_FD.0, &[socket.as_raw_fd()])?,
+            1
+        );
 
         // Create the c2s buffer
-        let c2s_buffer = alloc_zeroed_page_aligned::<[UnsafeCell<u8>; C2S_RING_BUFFER_LEN]>(C2S_RING_BUFFER_COUNT);
+        let c2s_buffer = alloc_zeroed_page_aligned::<[UnsafeCell<u8>; C2S_RING_BUFFER_LEN]>(
+            C2S_RING_BUFFER_COUNT,
+        );
         let buffer_ring = alloc_zeroed_page_aligned::<BufRingEntry>(C2S_RING_ENTRY_COUNT);
         {
-            let c2s_buffer = unsafe { std::slice::from_raw_parts(c2s_buffer, C2S_RING_BUFFER_COUNT) };
+            let c2s_buffer =
+                unsafe { std::slice::from_raw_parts(c2s_buffer, C2S_RING_BUFFER_COUNT) };
 
             assert!(C2S_RING_BUFFER_COUNT <= C2S_RING_ENTRY_COUNT);
             // SAFETY: Buffer count is smaller than the entry count, BufRingEntry is initialized with
             // zero, and the underlying will not be mutated during the loop
-            let buffer_ring = unsafe { std::slice::from_raw_parts_mut(buffer_ring, C2S_RING_BUFFER_COUNT) };
+            let buffer_ring =
+                unsafe { std::slice::from_raw_parts_mut(buffer_ring, C2S_RING_BUFFER_COUNT) };
 
             for (buffer_id, buffer) in buffer_ring.into_iter().enumerate() {
                 let underlying_data = &c2s_buffer[buffer_id];
@@ -823,28 +718,33 @@ impl Server {
             submitter.register_buf_ring(
                 buffer_ring as u64,
                 C2S_RING_ENTRY_COUNT as u16,
-                C2S_BUFFER_GROUP_ID
+                C2S_BUFFER_GROUP_ID,
             )?;
         }
 
+        let slab = Slab::with_capacity(2048);
+
         let mut this = Self {
-            listener,
+            socket,
             uring,
+            slab,
             c2s_buffer,
             c2s_local_tail: tail,
             c2s_shared_tail: tail_addr,
-            phantom: PhantomData
+            // phantom: PhantomData
         };
 
-        this.request_accept();
+        this.request(Token::MultiAccept);
 
         Ok(this)
     }
 
     /// # Safety
     /// Parameters of the entry must be valid for the duration of the operation
-    unsafe fn push_entry<'a>(&mut self, entry: &io_uring::squeue::Entry) {
-        let mut submission = self.uring.submission();
+    /// No submission queue can exist when called. See [`IoUring::submission_shared()`]
+    unsafe fn push_entry(&self, entry: &io_uring::squeue::Entry) {
+        // SAFETY: Function should never be called in parallel
+        let mut submission = self.uring.submission_shared();
         loop {
             if submission.push(entry).is_ok() {
                 return;
@@ -859,21 +759,26 @@ impl Server {
 
             // The submission queue really is full. The submission queue should be large enough so that
             // this code is never reached.
-            warn!("io_uring submission queue is full and this will lead to performance issues; consider increasing SUBMISSION_QUEUE_SIZE to avoid this");
+            warn!(
+                "io_uring submission queue is full and this will lead to performance issues; \
+                 consider increasing SUBMISSION_QUEUE_SIZE to avoid this"
+            );
             std::hint::spin_loop();
         }
     }
 
-    fn request_accept(&mut self) {
-        // SAFETY: This entry is valid
-        unsafe {
-            self.push_entry(&io_uring::opcode::AcceptMulti::new(LISTENER_FIXED_FD).allocate_file_index(true).build().user_data(0));
-        }
+    fn create_request(slab: &mut Slab<Token>, token: Token) -> squeue::Entry {
+        let op = token.op_code();
+
+        let idx = slab.insert(token);
+        op.user_data(idx as u64)
     }
 
-    fn request_recv(&mut self, fd: Fixed) {
+    pub fn request(&mut self, token: Token) {
+        let op = Self::create_request(&mut self.slab, token);
+
         unsafe {
-            self.push_entry(&io_uring::opcode::RecvMulti::new(fd, C2S_BUFFER_GROUP_ID).build().user_data((fd.0 + 2) as u64));
+            self.push_entry(&op);
         }
     }
 
@@ -881,7 +786,10 @@ impl Server {
         let mut completion = self.uring.completion();
         completion.sync();
         if completion.overflow() > 0 {
-            error!("the io_uring completion queue overflowed, and some connection errors are likely to occur; consider increasing COMPLETION_QUEUE_SIZE to avoid this");
+            error!(
+                "the io_uring completion queue overflowed, and some connection errors are likely \
+                 to occur; consider increasing COMPLETION_QUEUE_SIZE to avoid this"
+            );
         }
     }
 
@@ -891,62 +799,154 @@ impl Server {
         }
     }
 
-    pub fn next_event(&mut self) -> Option<ServerEvent> {
-        loop {
-            let mut completion = self.uring.completion().next()?;
-            match completion.user_data() {
-                0 => {
+    pub fn handle_events<F: FnMut(ServerEvent)>(&mut self, mut handler: F) {
+        // Safety: We have exclusive access to self and this function never creates another
+        // reference to the completion queue
+        let completions = unsafe { self.uring.completion_shared() };
+
+        for completion in completions {
+            let user_data = completion.user_data();
+            let Some(token) = self.slab.try_remove(user_data as usize) else {
+                error!("Got completion with bad user_data");
+                continue;
+            };
+
+            match token {
+                Token::MultiAccept => {
                     if completion.flags() & IORING_CQE_F_MORE == 0 {
                         warn!("multishot accept rerequested");
-                        self.request_accept();
+
+                        let op = Self::create_request(&mut self.slab, token);
+                        unsafe {
+                            self.push_entry(&op);
+                        }
                     }
 
-                    if completion.result() < 0 {
-                        error!("there was an error in accept: {}", completion.result());
-                    } else {
-                        let fd = Fixed(completion.result() as u32);
-                        self.request_recv(fd);
-                        return Some(ServerEvent::AddPlayer {
-                            fd
-                        });
+                    let res = completion.result();
+
+                    if res < 0 {
+                        let error = io::Error::from_raw_os_error(res.abs());
+                        error!("there was an error in accept: {}", error);
+
+                        continue;
                     }
-                },
-                1 => {
-                    warn!("got provide buffers response");
-                },
-                fd_plus_2 => {
-                    let fd = Fixed((fd_plus_2 - 2) as u32);
+
+                    let fd = Fixed(completion.result() as u32);
+
+                    let op = Self::create_request(&mut self.slab, Token::MultiRead { fd });
+                    unsafe {
+                        self.push_entry(&op);
+                    }
+
+                    (handler)(ServerEvent::AddPlayer { fd });
+                }
+                Token::MultiRead { fd } => {
                     let disconnected = completion.result() == 0;
 
                     if completion.flags() & IORING_CQE_F_MORE == 0 && !disconnected {
                         warn!("socket recv rerequested");
-                        self.request_recv(fd);
+
+                        let op = Self::create_request(&mut self.slab, token);
+                        unsafe {
+                            self.push_entry(&op);
+                        }
                     }
 
                     if disconnected {
-                        return Some(ServerEvent::RemovePlayer { fd });
-                    } else if completion.result() < 0 {
-                        error!("there was an error in recv: {}", completion.result());
-                    } else {
-                        println!("got socket receive");
-                        let bytes_received = completion.result() as usize;
-                        let buffer_id = buffer_select(completion.flags()).expect("there should be a buffer");
-                        assert!((buffer_id as usize) < C2S_RING_BUFFER_COUNT);
-                        // TODO: this is probably very unsafe
-                        let buffer = unsafe { *(self.c2s_buffer.add(buffer_id as usize) as *const [u8; C2S_RING_BUFFER_LEN]) };
-                        let buffer = &buffer[..bytes_received];
-                        dbg!(buffer);
+                        (handler)(ServerEvent::RemovePlayer { fd });
+                        continue;
+                    }
 
-                        self.c2s_local_tail = self.c2s_local_tail.wrapping_add(1);
+                    let res = completion.result();
 
-                        // TODO: sync less often
-                        // SAFETY: c2s_shared_tail is valid
+                    if res < 0 {
+                        let error = io::Error::from_raw_os_error(res.abs());
+                        error!("there was an error in recv: {}", error);
+
+                        continue;
+                    }
+
+                    println!("got socket receive");
+                    let bytes_received = completion.result() as usize;
+
+                    let buffer_id =
+                        buffer_select(completion.flags()).expect("there should be a buffer");
+                    assert!((buffer_id as usize) < C2S_RING_BUFFER_COUNT);
+
+                    // TODO: this is probably very unsafe
+                    let buffer = unsafe {
+                        *(self.c2s_buffer.add(buffer_id as usize)
+                            as *const [u8; C2S_RING_BUFFER_LEN])
+                    };
+
+                    let buffer = &buffer[..bytes_received];
+                    (handler)(ServerEvent::Receive { fd, buffer });
+
+                    self.c2s_local_tail = self.c2s_local_tail.wrapping_add(1);
+
+                    // TODO: sync less often
+                    // SAFETY: c2s_shared_tail is valid
+                    unsafe {
+                        (*self.c2s_shared_tail).store(self.c2s_local_tail, Ordering::Relaxed);
+                    }
+                }
+                Token::Write { fd, bufs } => {
+                    assert!(completion.flags() & IORING_CQE_F_MORE == 0);
+
+                    let res = completion.result();
+                    if res < 0 {
+                        let error = io::Error::from_raw_os_error(res.abs());
+                        error!("there was an error in writev: {}", error);
+
+                        continue;
+                    }
+
+                    println!("Socket wrote {res}");
+
+                    let bufs = bufs.progress(res as usize);
+                    if let Some(bufs) = bufs {
+                        let op = Self::create_request(&mut self.slab, Token::Write { fd, bufs });
                         unsafe {
-                            (*self.c2s_shared_tail).store(self.c2s_local_tail, Ordering::Relaxed);
+                            self.push_entry(&op);
                         }
                     }
                 }
+                Token::ProvideBuffers => {
+                    warn!("got provide buffers response");
+                }
             }
+        }
+    }
+}
+
+enum Token {
+    MultiAccept,
+    MultiRead {
+        fd: Fixed,
+        // TODO: Reference to player connection
+    },
+    Write {
+        fd: Fixed,
+        // TODO: Reference to player connection
+        bufs: Buf,
+    },
+    ProvideBuffers,
+}
+
+impl Token {
+    fn op_code(&self) -> squeue::Entry {
+        match self {
+            Token::MultiAccept => io_uring::opcode::AcceptMulti::new(LISTENER_FIXED_FD)
+                .allocate_file_index(true)
+                .build(),
+            Token::MultiRead { fd } => {
+                io_uring::opcode::RecvMulti::new(*fd, C2S_BUFFER_GROUP_ID).build()
+            }
+            Token::Write { fd, bufs } => {
+                let (ptr, len) = bufs.to_raw_parts();
+                io_uring::opcode::Write::new(*fd, ptr, len as u32).build()
+            }
+            Token::ProvideBuffers => todo!(),
         }
     }
 }

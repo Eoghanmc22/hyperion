@@ -27,9 +27,9 @@ use valence_protocol::{math::Vec3, CompressionThreshold, Hand};
 
 use crate::{
     global::Global,
-    net::{Encoder, ServerEvent, Server},
+    net::{Encoder, Server, ServerEvent},
     singleton::{
-        broadcast::BroadcastBuf, player_aabb_lookup::PlayerBoundingBoxes,
+        broadcast::BroadcastBuf, networking::Networking, player_aabb_lookup::PlayerBoundingBoxes,
         player_id_lookup::PlayerIdLookup, player_uuid_lookup::PlayerUuidLookup,
     },
     tracker::Tracker,
@@ -304,6 +304,10 @@ struct Gametick;
 #[derive(Event)]
 struct Egress;
 
+/// An event that is sent when it is time to do IO with io_uring
+#[derive(Event)]
+struct DoIoUring;
+
 /// on macOS, the soft limit for the number of open file descriptors is often 256. This is far too low
 /// to test 10k players with.
 /// This attempts to the specified `recommended_min` value.
@@ -351,7 +355,6 @@ pub struct Game {
     last_ms_per_tick: VecDeque<f64>,
     /// The tick of the game. This is incremented every 50 ms.
     tick_on: u64,
-    server: Server
 }
 
 impl Game {
@@ -404,9 +407,10 @@ impl Game {
             compression_level: CompressionThreshold(64),
         });
 
-        let server = Server::new(address)?;
-
         let mut world = World::new();
+
+        world.add_handler(system::net::submit_io_uring_events);
+        world.add_handler(system::net::handle_io_uring_completions);
 
         world.add_handler(system::ingress);
         world.add_handler(system::init_player);
@@ -456,13 +460,18 @@ impl Game {
         let encoder = world.spawn();
         world.insert(encoder, BroadcastBuf::new(shared.compression_level));
 
+        let networking = world.spawn();
+        world.insert(
+            networking,
+            Networking::new(address).context("Setup Networking")?,
+        );
+
         let mut game = Self {
             shared,
             world,
             last_ticks: VecDeque::default(),
             last_ms_per_tick: VecDeque::default(),
             tick_on: 0,
-            server
         };
 
         game.last_ticks.push_back(Instant::now());
@@ -532,57 +541,43 @@ impl Game {
 
         self.last_ticks.push_back(now);
 
-//        while let Ok(connection) = self.incoming.try_recv() {
-//            let ClientConnection {
-//                encoder,
-//                name,
-//                uuid,
-//                tx,
-//            } = connection;
-//
-//            let player = self.world.spawn();
-//
-//            let connection = Connection::new(tx);
-//
-//            let dx = fastrand::f32().mul_add(10.0, -5.0);
-//            let dz = fastrand::f32().mul_add(10.0, -5.0);
-//
-//            let event = InitPlayer {
-//                entity: player,
-//                encoder,
-//                connection,
-//                name,
-//                uuid,
-//                pos: FullEntityPose {
-//                    position: Vec3::new(dx, 30.0, dz),
-//                    bounding: Aabb::create(Vec3::new(0.0, 2.0, 0.0), 0.6, 1.8),
-//                    yaw: 0.0,
-//                    pitch: 0.0,
-//                },
-//            };
-//
-//            self.world.send(event);
-//        }
+        //        while let Ok(connection) = self.incoming.try_recv() {
+        //            let ClientConnection {
+        //                encoder,
+        //                name,
+        //                uuid,
+        //                tx,
+        //            } = connection;
+        //
+        //            let player = self.world.spawn();
+        //
+        //            let connection = Connection::new(tx);
+        //
+        //            let dx = fastrand::f32().mul_add(10.0, -5.0);
+        //            let dz = fastrand::f32().mul_add(10.0, -5.0);
+        //
+        //            let event = InitPlayer {
+        //                entity: player,
+        //                encoder,
+        //                connection,
+        //                name,
+        //                uuid,
+        //                pos: FullEntityPose {
+        //                    position: Vec3::new(dx, 30.0, dz),
+        //                    bounding: Aabb::create(Vec3::new(0.0, 2.0, 0.0), 0.6, 1.8),
+        //                    yaw: 0.0,
+        //                    pitch: 0.0,
+        //                },
+        //            };
+        //
+        //            self.world.send(event);
+        //        }
 
-        self.server.fetch_new_events();
-        while let Some(event) = self.server.next_event() {
-            match event {
-                ServerEvent::AddPlayer {
-                    fd
-                } => {
-                    info!("got a player with fd {}", fd.0);
-                },
-                ServerEvent::RemovePlayer {
-                    fd
-                } => {
-                    info!("removed a player with fd {}", fd.0);
-                }
-            }
-        }
-
+        self.world.send(DoIoUring);
         self.world.send(Gametick);
         self.world.send(Egress);
-        self.server.submit_events();
+        // TODO: Is this really needed twice?
+        self.world.send(DoIoUring);
 
         #[expect(
             clippy::cast_precision_loss,

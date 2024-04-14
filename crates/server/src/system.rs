@@ -14,6 +14,7 @@ mod init_entity;
 mod init_player;
 mod keep_alive;
 mod kill_all;
+pub mod net;
 mod pkt_attack;
 mod pkt_hand_swing;
 mod player_detect_mob_hits;

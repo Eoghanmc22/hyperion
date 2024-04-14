@@ -35,17 +35,23 @@ impl<S: Default> RayonLocal<S> {
             idx: 0,
         }
     }
+}
 
+impl<S> RayonLocal<S> {
     /// Create a new `RayonLocal` with the value of `S` provided by the closure for each thread.
-    pub fn init_with(mut f: impl FnMut() -> S) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returned error is the first error produced by the passes function
+    pub fn init_with<E>(mut f: impl FnMut() -> Result<S, E>) -> Result<Self, E> {
         let num_threads = rayon::current_num_threads();
 
-        let thread_locals = (0..=num_threads).map(|_| f()).collect();
+        let thread_locals = (0..=num_threads).map(|_| f()).collect::<Result<_, E>>()?;
 
-        Self {
+        Ok(Self {
             thread_locals,
             idx: 0,
-        }
+        })
     }
 
     /// Get the local value for the current thread.

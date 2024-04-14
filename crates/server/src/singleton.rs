@@ -2,6 +2,7 @@
 
 pub mod bounding_box;
 pub mod broadcast;
+pub mod networking;
 pub mod player_aabb_lookup;
 pub mod player_id_lookup;
 pub mod player_uuid_lookup;
